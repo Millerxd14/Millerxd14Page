@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video WebSocket Test</title>
+</head>
+<body>
+    <h1>Grabación de Video WebSocket</h1>
+    <button id="startButton">Iniciar Grabación</button>
+    <button id="stopButton" disabled>Detener Grabación</button>
+    <video id="preview" width="640" height="480" autoplay></video>
+    
+    <script>
+        let mediaRecorder;
+        let recordedChunks = [];
+        let socket;
+        
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const preview = document.getElementById('preview');
+        
+        startButton.addEventListener('click', async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                preview.srcObject = stream;
+                
+                // Conectar WebSocket
+                socket = new WebSocket('ws://backendinspiria-production.up.railway.app/ws/video');
+                socket.onopen = () => console.log('WebSocket conectado');
+                socket.onmessage = (event) => console.log('Mensaje del servidor:', event.data);
+                socket.onclose = () => console.log('WebSocket cerrado');
+                socket.onerror = (error) => console.error('Error de WebSocket:', error);
+                
+                // Configurar MediaRecorder para WebM
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        // Enviar cada chunk directamente al WebSocket
+                        if (socket.readyState === WebSocket.OPEN) {
+                            socket.send(event.data);
+                        }
+                    }
+                };
+                
+                // Generar datos cada 500ms
+                mediaRecorder.start(500);
+                startButton.disabled = true;
+                stopButton.disabled = false;
+            } catch (error) {
+                console.error('Error accediendo a la cámara:', error);
+            }
+        });
+        
+        stopButton.addEventListener('click', () => {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                preview.srcObject.getTracks().forEach(track => track.stop());
+                socket.close();
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            }
+        });
+    </script>
+</body>
+</html>
