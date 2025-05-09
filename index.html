@@ -1,65 +1,310 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
+    <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <title></title>
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Video WebSocket Test</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        h1, h2 { border-bottom: 1px solid #ccc; padding-bottom: 10px; }
+        video { border: 1px solid black; margin-top: 10px; background-color: #f0f0f0; }
+        button { margin: 5px 0; padding: 8px 12px; cursor: pointer; }
+        .container { margin-bottom: 30px; padding: 15px; border: 1px solid #eee; border-radius: 5px; }
+        .status { font-style: italic; color: #555; margin-top: 5px;}
+    </style>
 </head>
 <body>
-    <h1>Grabación de Video WebSocket</h1>
-    <button id="startButton">Iniciar Grabación</button>
-    <button id="stopButton" disabled>Detener Grabación</button>
-    <video id="preview" width="640" height="480" autoplay></video>
+    <div class="container">
+        <h1>Grabación y Envío de Video</h1>
+        <button id="startButton">Iniciar Grabación y Envío</button>
+        <button id="stopButton" disabled>Detener Grabación y Envío</button>
+        <video id="preview" width="320" height="240" autoplay muted></video>
+        <div id="sendStatus" class="status">Estado: Desconectado</div>
+    </div>
+
+    <hr>
+
+    <div class="container">
+        <h2>Recepción de Video</h2>
+        <button id="startReceiveButton">Iniciar Recepción</button>
+        <button id="stopReceiveButton" disabled>Detener Recepción</button>
+        <video id="receivedVideo" width="320" height="240" controls></video>
+        <div id="receiveStatus" class="status">Estado: Desconectado</div>
+    </div>
     
     <script>
+        // --- Sección de Envío de Video ---
         let mediaRecorder;
-        let recordedChunks = [];
-        let socket;
-        
+        let sendSocket;
         const startButton = document.getElementById('startButton');
         const stopButton = document.getElementById('stopButton');
         const preview = document.getElementById('preview');
+        const sendStatus = document.getElementById('sendStatus');
         
         startButton.addEventListener('click', async () => {
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); // CAMBIO: audio: false
                 preview.srcObject = stream;
+                preview.play(); 
                 
-                // Conectar WebSocket
-                socket = new WebSocket('wss://backendinspiria-production.up.railway.app/ws/video');
-                socket.onopen = () => console.log('WebSocket conectado');
-                socket.onmessage = (event) => console.log('Mensaje del servidor:', event.data);
-                socket.onclose = () => console.log('WebSocket cerrado');
-                socket.onerror = (error) => console.error('Error de WebSocket:', error);
+                sendSocket = new WebSocket('ws://localhost:6800/video/ws/in-stream');
                 
-                // Configurar MediaRecorder para WebM
-                mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
-                
-                mediaRecorder.ondataavailable = (event) => {
-                    if (event.data.size > 0) {
-                        // Enviar cada chunk directamente al WebSocket
-                        if (socket.readyState === WebSocket.OPEN) {
-                            socket.send(event.data);
+                sendSocket.onopen = () => {
+                    sendStatus.textContent = 'Estado: Conectado al servidor de envío.';
+                    console.log('WebSocket de envío conectado');
+                    
+                    const options = { mimeType: 'video/webm; codecs=vp8' }; // CAMBIO: removido ",opus"
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        console.warn(`${options.mimeType} no es soportado, intentando video/webm (sin codec específico)`);
+                        options.mimeType = 'video/webm'; // Fallback a video/webm genérico si vp8 no es soportado
+                        if(!MediaRecorder.isTypeSupported(options.mimeType)){
+                            alert("Ningún formato de video WebM soportado por MediaRecorder");
+                            sendSocket.close();
+                            return;
                         }
                     }
+                    mediaRecorder = new MediaRecorder(stream, options);
+                    
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0 && sendSocket.readyState === WebSocket.OPEN) {
+                            sendSocket.send(event.data);
+                        }
+                    };
+                    
+                    mediaRecorder.onstop = () => {
+                        if (preview.srcObject) {
+                            preview.srcObject.getTracks().forEach(track => track.stop());
+                        }
+                        if (sendSocket.readyState === WebSocket.OPEN) {
+                           sendSocket.close();
+                        }
+                    };
+                    
+                    mediaRecorder.start(500); // Enviar datos cada 500ms
+                    startButton.disabled = true;
+                    stopButton.disabled = false;
+                };
+
+                sendSocket.onmessage = (event) => console.log('Mensaje del servidor (envío):', event.data);
+                sendSocket.onclose = () => {
+                    sendStatus.textContent = 'Estado: Desconectado del servidor de envío.';
+                    console.log('WebSocket de envío cerrado');
+                    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                };
+                sendSocket.onerror = (error) => {
+                    sendStatus.textContent = 'Estado: Error en WebSocket de envío.';
+                    console.error('Error de WebSocket (envío):', error);
                 };
                 
-                // Generar datos cada 500ms
-                mediaRecorder.start(500);
-                startButton.disabled = true;
-                stopButton.disabled = false;
             } catch (error) {
+                sendStatus.textContent = `Estado: Error al acceder a la cámara: ${error.message}`;
                 console.error('Error accediendo a la cámara:', error);
             }
         });
         
         stopButton.addEventListener('click', () => {
             if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                mediaRecorder.stop();
-                preview.srcObject.getTracks().forEach(track => track.stop());
-                socket.close();
-                startButton.disabled = false;
-                stopButton.disabled = true;
+                mediaRecorder.stop(); // Esto también cerrará el socket en el handler onstop
             }
         });
+
+        // --- Sección de Recepción de Video ---
+        let receiveSocket;
+        let receivedMediaSource;
+        let receivedSourceBuffer;
+        const receivedVideoElement = document.getElementById('receivedVideo');
+        const startReceiveButton = document.getElementById('startReceiveButton');
+        const stopReceiveButton = document.getElementById('stopReceiveButton');
+        const receiveStatus = document.getElementById('receiveStatus');
+        let receiveQueue = [];
+
+        function cleanupVideoReceiverState() {
+            console.log("Limpiando estado del receptor de video...");
+            if (receiveSocket) {
+                // Remover listeners para evitar ejecuciones durante la limpieza
+                receiveSocket.onopen = null;
+                receiveSocket.onmessage = null;
+                receiveSocket.onerror = null;
+                const oldOnClose = receiveSocket.onclose;
+                receiveSocket.onclose = null; // Evitar que el onclose original se dispare si cerramos manualmente
+
+                if (receiveSocket.readyState === WebSocket.OPEN || receiveSocket.readyState === WebSocket.CONNECTING) {
+                    console.log("Cerrando WebSocket de recepción existente.");
+                    receiveSocket.close();
+                }
+                // Restaurar onclose brevemente si es necesario para alguna lógica de limpieza final, aunque es mejor evitarlo.
+            }
+            receiveSocket = null;
+
+            if (receivedMediaSource) {
+                if (receivedSourceBuffer) {
+                    try {
+                        // Solo intentar remover si MediaSource está 'open' y SourceBuffer no está 'updating'
+                        if (receivedMediaSource.readyState === 'open' && !receivedSourceBuffer.updating) {
+                           receivedMediaSource.removeSourceBuffer(receivedSourceBuffer);
+                           console.log("SourceBuffer removido.");
+                        }
+                    } catch (e) {
+                        console.error("Error removiendo SourceBuffer:", e);
+                    }
+                    receivedSourceBuffer = null;
+                }
+                // No llamar a endOfStream() si vamos a crear una nueva instancia de MediaSource,
+                // ya que puede poner el MediaSource en un estado final.
+                // Si el MediaSource está 'open', simplemente lo dejaremos ser recolectado por el GC
+                // cuando se reasigne receivedMediaSource.
+            }
+            receivedMediaSource = null; // Asegura que se cree uno nuevo la próxima vez
+
+            // Limpiar el elemento de video
+            if (receivedVideoElement.src && receivedVideoElement.src.startsWith('blob:')) {
+                URL.revokeObjectURL(receivedVideoElement.src); // Liberar la URL del objeto
+            }
+            receivedVideoElement.src = ""; // Limpiar el src
+            receivedVideoElement.removeAttribute('src'); // Para algunos navegadores
+            receivedVideoElement.load(); // Para resetear el elemento video y detener la reproducción
+            
+            receiveQueue = [];
+            receiveStatus.textContent = 'Estado: Desconectado.';
+            startReceiveButton.disabled = false;
+            stopReceiveButton.disabled = true;
+            console.log("Limpieza del receptor completada.");
+        }
+
+
+        function startVideoReceiver() {
+            // Prevenir múltiples intentos de conexión si ya está en proceso
+            if (receiveSocket && (receiveSocket.readyState === WebSocket.OPEN || receiveSocket.readyState === WebSocket.CONNECTING)) {
+                console.log("Receptor ya conectado o conectando.");
+                return;
+            }
+
+            cleanupVideoReceiverState(); // Asegurar un estado limpio antes de cada inicio
+
+            console.log("Iniciando receptor de video...");
+            receivedMediaSource = new MediaSource(); // Siempre crear una nueva instancia
+            receivedVideoElement.src = URL.createObjectURL(receivedMediaSource);
+            receiveStatus.textContent = 'Estado: Conectando al receptor...';
+
+            receivedMediaSource.addEventListener('sourceopen', () => {
+                console.log("MediaSource 'sourceopen' event.");
+                // Verificar que este es el MediaSource activo y está abierto
+                if (!receivedMediaSource || receivedMediaSource.readyState !== 'open') {
+                    console.warn("MediaSource no está en estado 'open' o ha cambiado. Abortando sourceopen handler.");
+                    return;
+                }
+                try {
+                    const mimeCodec = 'video/webm; codecs="vp8"'; // Solo video VP8
+                    if (!MediaSource.isTypeSupported(mimeCodec)) {
+                         console.warn(`${mimeCodec} no es soportado por MediaSource, intentando video/webm genérico`);
+                         receivedSourceBuffer = receivedMediaSource.addSourceBuffer('video/webm');
+                    } else {
+                         receivedSourceBuffer = receivedMediaSource.addSourceBuffer(mimeCodec);
+                    }
+                    console.log("SourceBuffer creado:", receivedSourceBuffer);
+                   
+                    receivedSourceBuffer.mode = 'sequence'; 
+
+                    receivedSourceBuffer.addEventListener('updateend', () => {
+                        // Procesar cola solo si todo está en orden
+                        if (receiveQueue.length > 0 && 
+                            receivedMediaSource && receivedMediaSource.readyState === 'open' &&
+                            receivedSourceBuffer && !receivedSourceBuffer.updating) {
+                            try {
+                                receivedSourceBuffer.appendBuffer(receiveQueue.shift());
+                            } catch (e) {
+                                console.error("Error procesando cola en updateend:", e);
+                                cleanupVideoReceiverState(); // Error crítico, limpiar.
+                            }
+                        }
+                    });
+                    receivedSourceBuffer.addEventListener('error', (e) => {
+                        console.error("Error en SourceBuffer:", e);
+                        cleanupVideoReceiverState(); // Error crítico, limpiar.
+                    });
+
+                    // Conectar WebSocket después de que SourceBuffer esté listo
+                    receiveSocket = new WebSocket('ws://localhost:6800/video/ws/video-receiver');
+                    receiveSocket.binaryType = 'arraybuffer';
+
+                    receiveSocket.onopen = () => {
+                        console.log('WebSocket de recepción conectado');
+                        // Verificar estado antes de actualizar UI
+                        if (receiveSocket && receiveSocket.readyState === WebSocket.OPEN) {
+                            receiveStatus.textContent = 'Estado: Conectado. Esperando video...';
+                            startReceiveButton.disabled = true;
+                            stopReceiveButton.disabled = false;
+                        }
+                    };
+
+                    receiveSocket.onmessage = async (event) => {
+                        if (event.data instanceof ArrayBuffer) {
+                            // Asegurarse de que todo esté listo antes de agregar datos
+                            if (receivedMediaSource && receivedMediaSource.readyState === 'open' && 
+                                receivedSourceBuffer && !receivedSourceBuffer.updating) {
+                                try {
+                                    receivedSourceBuffer.appendBuffer(event.data);
+                                } catch (e) {
+                                    console.error("Error appending buffer en onmessage: ", e); // Aquí ocurría tu error
+                                    receiveStatus.textContent = `Estado: Error al procesar video: ${e.message}`;
+                                    cleanupVideoReceiverState(); // Limpiar si appendBuffer falla
+                                }
+                            } else if (receivedMediaSource && receivedMediaSource.readyState === 'open' && receivedSourceBuffer) {
+                                receiveQueue.push(event.data); // Encolar si el buffer está ocupado
+                            } else {
+                                console.warn("MediaSource/SourceBuffer no listos en onmessage. Descartando datos.");
+                            }
+                        }
+                    };
+
+                    receiveSocket.onclose = (event) => {
+                        console.log('WebSocket de recepción cerrado. Code:', event.code, 'Reason:', event.reason);
+                        // Solo limpiar si el socket no fue cerrado como parte de cleanupVideoReceiverState
+                        // Verificamos si 'receiveSocket' (la variable global) sigue siendo este socket.
+                        // Si cleanupVideoReceiverState ya lo puso a null, no hacemos nada aquí.
+                        if (receiveSocket === event.target) {
+                           cleanupVideoReceiverState();
+                        }
+                    };
+
+                    receiveSocket.onerror = (error) => {
+                        console.error('Error de WebSocket (recepción):', error);
+                        if (receiveSocket === error.target) {
+                            cleanupVideoReceiverState();
+                        }
+                    };
+
+                } catch (e) {
+                    console.error("Error crítico configurando MediaSource o SourceBuffer: ", e);
+                    receiveStatus.textContent = `Estado: Error MediaSource: ${e.message}`;
+                    cleanupVideoReceiverState(); // Limpiar si hay un error en la configuración.
+                }
+            });
+            // Handlers de error para el MediaSource mismo
+            receivedMediaSource.addEventListener('sourceended', () => console.log('MediaSource ended'));
+            receivedMediaSource.addEventListener('sourceclose', () => {
+                console.log('MediaSource closed');
+                // Si el MediaSource se cierra inesperadamente, podría ser necesario limpiar.
+                // Pero cleanupVideoReceiverState() ya debería manejar la mayoría de los casos.
+            });
+            receivedMediaSource.addEventListener('error', (e) => {
+                console.error("Error general en MediaSource:", e);
+                cleanupVideoReceiverState();
+            });
+        }
+
+        // Event listeners para los botones
+        startReceiveButton.addEventListener('click', startVideoReceiver);
+        stopReceiveButton.addEventListener('click', cleanupVideoReceiverState);
+
+        // Iniciar automáticamente al cargar la página (como lo tenías)
+        window.addEventListener('load', startVideoReceiver);
+
     </script>
 </body>
 </html>
